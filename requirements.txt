@@ -1,4 +1,4 @@
-livekit-agents[openai,silero,groq]~=1.0
+livekit-agents[openai,silero,groq,turn-detector]~=1.0
 python-dotenv
 openai
 aiohttp
