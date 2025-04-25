@@ -135,14 +135,45 @@ class AntyAgent(Agent):
         direct_openai_client: DirectAsyncOpenAI,
         local_participant: LocalParticipant,
     ) -> None:
-        super().__init__(
-            instructions=(
-                "Anda adalah 'Anty', asisten suara yang ramah dan empatik dalam Bahasa Indonesia. "
-                "Kepribadian Anda suportif, membantu, dan sedikit informal namun selalu sopan. "
-                "Jaga agar respons tetap ringkas dan percakapan dalam Bahasa Indonesia. "
-                "Gunakan fungsi yang tersedia jika diperlukan untuk mengingat informasi, mencari di internet, atau mengatur alarm."
-            )
+        try:
+            import locale
+            # Coba set locale ke Indonesian. Jika gagal, format default akan digunakan.
+            # Locale yang mungkin: 'id_ID', 'id_ID.UTF-8', 'Indonesian_indonesia.1252'
+            # Periksa locale yang tersedia di sistem Anda dengan `locale -a`
+            available_locales = locale.locale_alias.keys()
+            target_locale = None
+            for loc in ['id_ID.utf8', 'id_ID.UTF-8', 'id_ID', 'Indonesian_Indonesia']:
+                 if loc.lower() in available_locales:
+                     target_locale = loc
+                     break
+            if target_locale:
+                locale.setlocale(locale.LC_TIME, target_locale)
+                logger.info(f"Locale set to {target_locale} for date formatting.")
+            else:
+                 logger.warning("Indonesian locale not found, using system default for date.")
+        except ImportError:
+            logger.warning("Locale module not available, using default date format.")
+        except Exception as e:
+            logger.warning(f"Failed to set locale to Indonesian: {e}")
+
+        # Format tanggal dalam Bahasa Indonesia (Nama hari, tanggal bulan tahun)
+        today_date_str = datetime.date.today().strftime('%A, %d %B %Y')
+
+        # 2. Masukkan tanggal ke dalam instruksi menggunakan f-string
+        agent_instructions = (
+            f"Anda adalah 'Anty', asisten suara yang ramah dan empatik dalam Bahasa Indonesia. "
+            f"Kepribadian Anda suportif, membantu, dan sedikit informal namun selalu sopan. "
+            f"Hari ini adalah {today_date_str}. Gunakan informasi tanggal ini untuk membantu memahami permintaan terkait waktu, seperti 'besok' atau 'Selasa depan'. " # <-- Tanggal ditambahkan di sini
+            f"Jaga agar respons tetap ringkas dan percakapan dalam Bahasa Indonesia. "
+            f"Gunakan fungsi yang tersedia jika diperlukan untuk mengingat informasi, mencari di internet, atau mengatur alarm (terutama untuk tanggal relatif)."
+            "Pedoman:\n"
+            "- Gunakan respons singkat dan ringkas, hindari penggunaan tanda baca yang sulit diucapkan.\n"
+            "- Jaga agar respons tetap ringkas dan percakapan dalam Bahasa Indonesia.\n"
+            "- Bersikaplah empatik dan suportif secara alami.\n"
+            "- Gunakan fungsi memori untuk mempersonalisasi percakapan.\n"
         )
+
+        super().__init__(instructions=agent_instructions)
         self._mem0_client = mem0_client
         self._user_id = user_id
         self._direct_openai_client = direct_openai_client
