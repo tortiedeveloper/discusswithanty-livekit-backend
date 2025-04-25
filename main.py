@@ -414,7 +414,7 @@ class AntyAgent(Agent):
 
         logger.info(f"LLM requests internet search for user {self._user_id} with query: '{query}'")
 
-        filler_message = f"Oke, saya coba cari informasi terbaru tentang '{query[:30]}...' ya."
+        filler_message = f"Oke, saya coba cari informasi terbaru tentang '{query}...' ya."
         logger.info(f"Speaking filler message: '{filler_message}'")
         try:
             await self.session.say(text=filler_message, allow_interruptions=True)
