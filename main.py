@@ -8,6 +8,7 @@ import traceback
 from typing import AsyncGenerator, Optional, Callable, Awaitable, Annotated
 from dotenv import load_dotenv
 import aiohttp
+from functools import partial
 
 from openai import AsyncOpenAI as DirectAsyncOpenAI
 
@@ -29,8 +30,12 @@ from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import openai, silero, groq
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.rtc import Room, DataPacketKind, LocalParticipant, RemoteParticipant, DataPacket
+from livekit.agents.voice import SpeechHandle, SpeechCreatedEvent 
 
 from mem0 import MemoryClient
+from num2words import num2words
+import re
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -126,6 +131,20 @@ async def generate_summary_with_llm(openai_client: DirectAsyncOpenAI, transcript
     except Exception as e:
         logger.error(f"Error during DIRECT OpenAI API summarization: {e}", exc_info=True)
         return f"Error saat membuat ringkasan (direct call): {type(e).__name__}"
+    
+def preprocess_text_for_tts(text: str) -> str:
+    # Fungsi ini mencari angka dan mengubahnya menjadi kata (Bahasa Indonesia)
+    def number_to_words_id(match):
+        try:
+            number = int(match.group(0))
+            # Gunakan lang='id' untuk Bahasa Indonesia
+            return num2words(number, lang='id')
+        except ValueError:
+            return match.group(0) # Kembalikan seperti semula jika bukan integer valid
+
+    # Gunakan regex untuk menemukan urutan angka
+    processed_text = re.sub(r'\d+', number_to_words_id, text)
+    return processed_text
 
 class AntyAgent(Agent):
     def __init__(
@@ -171,6 +190,10 @@ class AntyAgent(Agent):
             "- Jaga agar respons tetap ringkas dan percakapan dalam Bahasa Indonesia.\n"
             "- Bersikaplah empatik dan suportif secara alami.\n"
             "- Gunakan fungsi memori untuk mempersonalisasi percakapan.\n"
+            "- Jangan berikan karakter karakter yang susah untuk disebutkan dalam TTS.\n"
+            "- Jangan berikan respons yang berupa angka, tapi buat angka itu menjadi kata kata yang bisa dibaca, misal jika response nya adalah 2025 maka ubah menjadi dua ribu dua puluh lima.\n"
+            "- Respons yang anda berikan nanti akan diproses oleh sistem TTS jadi berikan respons yang dapat dibacakan dan dipahami konteks nya ketika dibacakan\n"
+            
         )
 
         super().__init__(instructions=agent_instructions)
@@ -220,7 +243,7 @@ class AntyAgent(Agent):
 
                             # Pindahkan 'say' ke sini agar hanya diucapkan jika pengiriman berhasil
                             logger.info("Attempting to speak the summary...")
-                            await self.session.say(text=f"Berikut ringkasan meetingnya: {summary_text}", allow_interruptions=True)
+                            await self.session.say(text=preprocess_text_for_tts(f"Berikut ringkasan meetingnya: {summary_text}"), allow_interruptions=False)
                             logger.info("Summary spoken.")
 
                         except Exception as send_e:
@@ -438,41 +461,62 @@ class AntyAgent(Agent):
     ):
         if not query or not query.strip():
             logger.warning("LLM called search_internet with empty query.")
-            return "Tolong berikan topik atau pertanyaan spesifik yang ingin Anda cari informasinya."
+            return preprocess_text_for_tts("Tolong berikan topik atau pertanyaan spesifik yang ingin Anda cari informasinya.") # Preprocess error message
         if not PERPLEXITY_API_KEY:
             logger.error("Cannot search internet: PERPLEXITY_API_KEY not configured.")
-            return "Maaf, saya tidak dapat melakukan pencarian internet saat ini karena konfigurasi API Key belum diatur."
+            return preprocess_text_for_tts("Maaf, saya tidak dapat melakukan pencarian internet saat ini karena konfigurasi API Key belum diatur.") # Preprocess error message
 
         logger.info(f"LLM requests internet search for user {self._user_id} with query: '{query}'")
 
-        filler_message = f"Oke, saya coba cari informasi terbaru tentang '{query}...' ya."
+        # --- LANGKAH 1: Ucapkan Filler ---
+        filler_message = f"Baik, mohon tunggu sebentar ya selagi saya mencari informasi terbaru mengenai {query}... di internet untuk Anda.."
         logger.info(f"Speaking filler message: '{filler_message}'")
         try:
-            await self.session.say(text=filler_message, allow_interruptions=True)
+            # Preprocess filler message juga untuk konsistensi angka jika ada
+            await self.session.say(text=preprocess_text_for_tts(filler_message), allow_interruptions=False)
         except Exception as say_err:
             logger.error(f"Error speaking filler message during search: {say_err}", exc_info=True)
+            # Tidak perlu menghentikan musik di sini karena belum dimulai
 
+        # --- LANGKAH 2: Kirim Perintah Mulai Musik Tunggu ---
+        logger.info(f"Sending 'play_waiting_music' command to user {self._user_id}")
+        start_payload = {"type": "play_waiting_music"}
+        start_payload_bytes = json.dumps(start_payload).encode('utf-8')
         try:
-            headers = {
+            if not hasattr(self, '_local_participant_ref') or not self._local_participant_ref:
+                 logger.error("Cannot send play_waiting_music: Explicit local_participant reference not found.")
+            else:
+                await asyncio.wait_for(
+                    self._local_participant_ref.publish_data(payload=start_payload_bytes),
+                    timeout=DEVICE_ACTION_TIMEOUT # Gunakan timeout yang sesuai
+                )
+                logger.info("Successfully sent 'play_waiting_music' command.")
+        except Exception as e:
+            logger.error(f"Failed to send 'play_waiting_music' command: {e}", exc_info=True)
+            # Lanjutkan pencarian meskipun gagal mengirim perintah musik
+
+        # --- LANGKAH 3: Lakukan Pencarian Internet ---
+        search_content = None
+        search_error_message = None
+        try:
+            headers = { # ... (headers seperti sebelumnya) ...
                 "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            data = {
-                "model": "sonar",
-                "messages": [
-                    {"role": "system", "content": "You are an AI assistant that searches the internet to provide accurate, concise, and up-to-date answers in Indonesian based on the user's query. Cite sources if possible."},
-                    {"role": "user", "content": query}
-                ]
+            data = { # ... (data seperti sebelumnya) ...
+                 "model": "sonar",
+                 "messages": [
+                     {"role": "system", "content": "You are an AI assistant that searches the internet to provide accurate, concise, and up-to-date answers in Indonesian based on the user's query. Cite sources if possible."},
+                     {"role": "user", "content": query}
+                 ]
             }
 
             logger.debug(f"Making request to Perplexity API with data: {json.dumps(data)}")
             async with aiohttp.ClientSession() as http_session:
                 async with http_session.post(
                         "https://api.perplexity.ai/chat/completions",
-                        headers=headers,
-                        json=data,
-                        timeout=INTERNET_SEARCH_TIMEOUT
+                        headers=headers, json=data, timeout=INTERNET_SEARCH_TIMEOUT
                 ) as response:
                     logger.debug(f"Perplexity API response status: {response.status}")
                     if response.status == 200:
@@ -480,43 +524,117 @@ class AntyAgent(Agent):
                         logger.debug(f"Successfully received response from Perplexity API: {json.dumps(result)[:200]}...")
                         if "choices" in result and len(result["choices"]) > 0 and \
                            "message" in result["choices"][0] and "content" in result["choices"][0]["message"]:
-                            content = result["choices"][0]["message"]["content"]
-                            logger.info(f"Internet search successful for query: '{query}'. Result length: {len(content)}")
-                            return content
+                            search_content = result["choices"][0]["message"]["content"] # Simpan ke variabel sementara
+                            logger.info(f"Internet search successful for query: '{query}'. Result length: {len(search_content)}")
                         else:
                             logger.error(f"Unexpected response structure from Perplexity: {json.dumps(result)}")
-                            return "Maaf, saya menerima format respons yang tidak terduga dari layanan pencarian."
+                            search_error_message = "Maaf, saya menerima format respons yang tidak terduga dari layanan pencarian."
                     else:
                         error_text = await response.text()
                         logger.error(f"Error from Perplexity API (Status {response.status}): {error_text}")
-                        if response.status == 401: return "Maaf, terjadi masalah otentikasi dengan layanan pencarian."
-                        elif response.status == 429: return "Maaf, batas penggunaan layanan pencarian telah tercapai. Coba lagi nanti."
-                        elif response.status >= 500: return "Maaf, layanan pencarian sedang mengalami masalah internal."
-                        else: return f"Maaf, terjadi kesalahan saat mencari informasi (Kode: {response.status})."
+                        if response.status == 401: search_error_message = "Maaf, terjadi masalah otentikasi dengan layanan pencarian."
+                        elif response.status == 429: search_error_message = "Maaf, batas penggunaan layanan pencarian telah tercapai. Coba lagi nanti."
+                        elif response.status >= 500: search_error_message = "Maaf, layanan pencarian sedang mengalami masalah internal."
+                        else: search_error_message = f"Maaf, terjadi kesalahan saat mencari informasi (Kode: {response.status})."
 
         except asyncio.TimeoutError:
              logger.error(f"Internet search timed out after {INTERNET_SEARCH_TIMEOUT}s for query: '{query}'")
-             return "Maaf, pencarian informasi memakan waktu terlalu lama. Silakan coba lagi."
+             search_error_message = "Maaf, pencarian informasi memakan waktu terlalu lama. Silakan coba lagi."
         except aiohttp.ClientError as e:
              logger.error(f"Network error during internet search: {e}", exc_info=True)
-             return "Maaf, terjadi masalah jaringan saat mencoba mencari informasi."
+             search_error_message = "Maaf, terjadi masalah jaringan saat mencoba mencari informasi."
         except Exception as e:
             error_details = traceback.format_exc()
             logger.error(f"Exception in search_internet: {str(e)}\n{error_details}")
-            return f"Maaf, terjadi kesalahan tak terduga saat mencoba melakukan pencarian: {str(e)}"
+            search_error_message = f"Maaf, terjadi kesalahan tak terduga saat mencoba melakukan pencarian: {str(e)}"
+
+        # --- LANGKAH 4: Kirim Perintah Hentikan Musik Tunggu ---
+        logger.info(f"Sending 'stop_waiting_music' command to user {self._user_id}")
+        stop_payload = {"type": "stop_waiting_music"}
+        stop_payload_bytes = json.dumps(stop_payload).encode('utf-8')
+        try:
+             if not hasattr(self, '_local_participant_ref') or not self._local_participant_ref:
+                 logger.error("Cannot send stop_waiting_music: Explicit local_participant reference not found.")
+             else:
+                await asyncio.wait_for(
+                    self._local_participant_ref.publish_data(payload=stop_payload_bytes),
+                    timeout=DEVICE_ACTION_TIMEOUT # Gunakan timeout yang sesuai
+                )
+                logger.info("Successfully sent 'stop_waiting_music' command.")
+                # Beri jeda SANGAT SINGKAT agar klien sempat memproses stop sebelum TTS mulai
+                await asyncio.sleep(0.1) # 100ms delay
+        except Exception as e:
+            logger.error(f"Failed to send 'stop_waiting_music' command: {e}", exc_info=True)
+            # Tetap lanjutkan untuk memberikan hasil/error
+
+        # --- LANGKAH 5: Kembalikan Hasil atau Pesan Error (Akan di-TTS) ---
+        if search_content:
+             # Preprocess hasil sebelum dikembalikan
+             return preprocess_text_for_tts(search_content)
+        else:
+             # Preprocess pesan error sebelum dikembalikan
+             return preprocess_text_for_tts(search_error_message or "Maaf, terjadi kesalahan yang tidak diketahui saat mencari.")
 
 def prewarm(proc: JobProcess):
     logger.info("Prewarming VAD model...")
     try:
+        # Pastikan silero.VAD.load() adalah metode yang benar
         proc.userdata["vad"] = silero.VAD.load()
         logger.info("VAD model prewarmed successfully.")
     except Exception as e:
         logger.error(f"Failed to prewarm VAD model: {e}", exc_info=True)
         proc.userdata["vad"] = None
 
+# --- Fungsi Helper untuk TTS Completion Callback (Tetap sama) ---
+async def publish_speech_end_flag(participant: Optional[LocalParticipant]):
+    """Coroutine to send the agent_speech_end flag via data channel."""
+    if not participant:
+        logger.error("Cannot send speech end flag: local participant is None.")
+        return
+
+    payload_dict = {
+        "type": "agent_speech_end",
+        # Pertimbangkan time.time() jika perlu konsistensi dengan timestamp lain
+        "timestamp": asyncio.get_event_loop().time()
+    }
+    payload_bytes = json.dumps(payload_dict).encode("utf-8")
+    try:
+        # --- MODIFIKASI PESAN LOG ---
+        # logger.info(f"Sending agent_speech_end flag to room {participant.room.name}.") # <-- Baris Lama Penyebab Error
+        logger.info(f"Sending agent_speech_end flag for participant {participant.identity}.") # <-- Log yang Disederhanakan
+
+        # Mengirim data tetap sama
+        await participant.publish_data(payload=payload_bytes, reliable=True, topic="agent_state")
+        logger.info("agent_speech_end flag sent successfully.")
+    except Exception as e:
+        # Tambahkan exc_info untuk detail error yang lebih lengkap
+        logger.error(f"Failed to publish agent_speech_end flag: {e}", exc_info=True)
+
+def speech_completion_callback(handle: SpeechHandle, participant: Optional[LocalParticipant]):
+    """
+    Callback executed when the SpeechHandle completes (naturally or via interruption).
+    Schedules the flag sending regardless of interruption status.
+    """
+    if participant is None:
+        logger.error("Speech completion callback invoked with None participant.")
+        return
+
+    try:
+      
+        interruption_status = "interrupted" if handle.interrupted else "completed naturally"
+        logger.info(f"Speech ended ({interruption_status}), scheduling agent_speech_end flag send.")
+        asyncio.create_task(publish_speech_end_flag(participant))
+     
+    except asyncio.CancelledError:
+        logger.info("Speech task was cancelled.") # Tetap tangani pembatalan eksplisit jika ada
+    except Exception as e:
+        # Tangkap error lain dalam logika callback
+        logger.error(f"Error in speech completion callback logic: {e}", exc_info=True)
+
 async def entrypoint(ctx: JobContext):
     start_entrypoint_time = time.time()
-    ephemeral_room_name = ctx.room.name
+    # Dapatkan nama room dari context job SEBELUM connect
+    ephemeral_room_name = ctx.job.room.name
     job_id = ctx.job.id
     logger.info(f"Initializing agent job {job_id} for room: {ephemeral_room_name}")
 
@@ -524,93 +642,147 @@ async def entrypoint(ctx: JobContext):
     local_mem0_client: Optional[MemoryClient] = None
     direct_openai_client: Optional[DirectAsyncOpenAI] = None
     extracted_user_name: Optional[str] = None
+    session: Optional[AgentSession] = None # Inisialisasi session
+    agent: Optional[AntyAgent] = None # Inisialisasi agent
+    local_participant: Optional[LocalParticipant] = None # Inisialisasi local_participant
+    room_data_handler_sync_defined = False # Flag untuk handler data
+    room_data_handler_sync = None # Placeholder untuk fungsi handler
 
     try:
+        # --- Ekstraksi User ID (Menggunakan Logika dari Kode Lama Anda) ---
         try:
             parts = ephemeral_room_name.split('-')
+            # GUNAKAN LOGIKA YANG BENAR DARI KODE LAMA ANDA
             if len(parts) == 3 and parts[0] == "usession":
                 persistent_user_id = parts[1]
                 logger.info(f"Job {job_id}: Extracted persistent user_id: {persistent_user_id}")
             else:
+                # Konsisten dengan kode lama, log error dan raise
                 logger.error(f"Job {job_id}: Could not parse user_id from room name format: {ephemeral_room_name}")
                 raise ValueError("Invalid room name format for user_id extraction")
         except Exception as e:
-            logger.error(f"Job {job_id}: Error extracting user_id: {e}", exc_info=True)
-            raise ValueError("Failed to determine persistent user_id from room name") from e
+            logger.error(f"Job {job_id}: Error processing room name for user_id: {e}", exc_info=True)
+            # Re-raise agar ditangkap oleh blok except utama entrypoint
+            raise ValueError(f"Failed to determine persistent user_id from room name: {ephemeral_room_name}") from e
 
+        # Pengecekan user ID setelah blok try-except parsing
         if not persistent_user_id:
-             logger.critical(f"FATAL: Job {job_id}: persistent_user_id is None.")
+             # Ini seharusnya tidak tercapai jika raise ValueError di atas bekerja
+             logger.critical(f"FATAL: Job {job_id}: persistent_user_id is None after parsing attempt.")
              raise SystemExit("Could not obtain user_id")
 
+        # Set log context setelah user_id pasti ada
         ctx.log_context_fields = {
-            "room": ctx.room.name,
+            "room": ephemeral_room_name, # Gunakan nama room awal
             "user_id": persistent_user_id,
             "job_id": job_id,
         }
         logger.info(f"Log context updated with user_id: {persistent_user_id}")
 
+        # --- Inisialisasi Mem0 (Tetap Sama) ---
         if MEM0_API_KEY:
             logger.info(f"Job {job_id}: Initializing Mem0 Client...")
             try:
-                local_mem0_client = MemoryClient()
+                local_mem0_client = MemoryClient(api_key=MEM0_API_KEY) # Asumsi perlu API key
                 logger.info(f"Job {job_id}: Mem0 Client initialized.")
-
+                # ... (logika pencarian memori awal tetap sama) ...
                 logger.info(f"Retrieving initial context from Mem0 for user '{persistent_user_id}'...")
                 general_memories = await search_mem0_with_timeout(
                     local_mem0_client, persistent_user_id, SEMANTIC_QUERY_GENERAL_STARTUP, limit=5
                 )
-                if isinstance(general_memories, list):
-                    retrieved_general_memory_texts = [
-                        mem.get('memory') for mem in general_memories
-                        if isinstance(mem, dict) and mem.get('memory')
-                    ]
-                    logger.info(f"Retrieved {len(retrieved_general_memory_texts)} general context memories.")
-                    for mem_text in retrieved_general_memory_texts:
-                        if "name is" in mem_text.lower():
-                            try:
-                                parts = mem_text.lower().split("name is", 1)
-                                if len(parts) > 1:
-                                    potential_name = parts[1].strip().split()[0].rstrip('.?!,').capitalize()
-                                    if potential_name:
-                                        extracted_user_name = potential_name
-                                        logger.info(f"Tentatively extracted user name from memory: {extracted_user_name}")
-                                        break
-                            except Exception as e:
-                                logger.warning(f"Error extracting name from memory '{mem_text}': {e}")
+                if isinstance(general_memories, list) and general_memories:
+                     retrieved_general_memory_texts = [ mem.get('memory') for mem in general_memories if isinstance(mem, dict) and mem.get('memory') ]
+                     logger.info(f"Retrieved {len(retrieved_general_memory_texts)} general context memories.")
+                     for mem_text in retrieved_general_memory_texts:
+                          if "name is" in mem_text.lower():
+                              try:
+                                  match = re.search(r"name is\s+([a-zA-Z]+)", mem_text, re.IGNORECASE)
+                                  if match:
+                                       potential_name = match.group(1).strip().capitalize()
+                                       if potential_name:
+                                            extracted_user_name = potential_name
+                                            logger.info(f"Tentatively extracted user name from memory: {extracted_user_name}")
+                                            break
+                              except Exception as e:
+                                   logger.warning(f"Error extracting name from memory '{mem_text}': {e}")
+                elif isinstance(general_memories, list):
+                      logger.info(f"No general context memories found in Mem0 for user {persistent_user_id}.")
                 else:
-                    logger.warning(f"Failed to retrieve general context or none found for user {persistent_user_id}.")
-
+                      logger.warning(f"Failed to retrieve general context from Mem0 for user {persistent_user_id}.")
             except Exception as e:
-                logger.error(f"Job {job_id}: Failed to initialize Mem0 Client or retrieve context: {e}", exc_info=True)
-                local_mem0_client = None
+                 logger.error(f"Job {job_id}: Failed to initialize Mem0 Client or retrieve context: {e}", exc_info=True)
+                 local_mem0_client = None
         else:
-            logger.warning(f"Job {job_id}: MEM0_API_KEY not found, Mem0 features disabled.")
+             logger.warning(f"Job {job_id}: MEM0_API_KEY not found, Mem0 features disabled.")
 
+        # --- Inisialisasi Direct OpenAI Client (Tetap Sama) ---
         if OPENAI_API_KEY:
              logger.info(f"Job {job_id}: Initializing Direct OpenAI Client...")
-             direct_openai_client = DirectAsyncOpenAI(api_key=OPENAI_API_KEY)
-             logger.info(f"Job {job_id}: Direct OpenAI Client initialized.")
+             try:
+                 direct_openai_client = DirectAsyncOpenAI(api_key=OPENAI_API_KEY)
+                 logger.info(f"Job {job_id}: Direct OpenAI Client initialized.")
+             except Exception as e:
+                  logger.error(f"Job {job_id}: Failed to initialize Direct OpenAI Client: {e}", exc_info=True)
+                  direct_openai_client = None # Tetap None jika gagal
         else:
-             logger.error(f"Job {job_id}: Cannot initialize Direct OpenAI Client - OPENAI_API_KEY missing.")
+              logger.error(f"Job {job_id}: Cannot initialize Direct OpenAI Client - OPENAI_API_KEY missing.")
 
+        # --- Koneksi ke Room ---
         logger.info(f"Job {job_id}: Connecting to LiveKit room...")
         await ctx.connect()
-        logger.info(f"Job {job_id}: Agent connected to room: {ephemeral_room_name}")
+        # Setelah connect, ctx.room dan ctx.room.local_participant tersedia
+        logger.info(f"Job {job_id}: Agent connected to room: {ctx.room.name}")
 
+        # --- Dapatkan Local Participant ---
+        if not ctx.room or not ctx.room.local_participant:
+             logger.critical(f"Job {job_id}: Room or LocalParticipant not available after connect. Cannot proceed.")
+             raise ConnectionError("Failed to get local participant after connecting.")
+        local_participant = ctx.room.local_participant # Simpan untuk digunakan nanti
+        logger.info(f"Job {job_id}: Obtained local participant: {local_participant.identity}")
+
+        # --- Dapatkan VAD Plugin ---
         vad_plugin = ctx.proc.userdata.get("vad")
         if not vad_plugin:
              logger.error(f"Job {job_id}: VAD plugin not loaded during prewarm. Agent might not function correctly.")
+             # Anda bisa fallback ke default VAD jika perlu:
+             # logger.warning("Falling back to default Silero VAD.")
+             # vad_plugin = silero.VAD.load() # Atau cara inisialisasi default VAD
 
+        # --- Buat AgentSession ---
         logger.info(f"Job {job_id}: Creating AgentSession...")
-        session = AgentSession(
-            vad=vad_plugin,
-            stt=groq.STT(model="whisper-large-v3-turbo", language="id"),
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova"),
-            turn_detection=MultilingualModel(),
-        )
-        logger.info(f"Job {job_id}: AgentSession created.")
+        try:
+            session = AgentSession(
+                vad=vad_plugin,
+                stt=groq.STT(model="whisper-large-v3-turbo", language="id"),
+                llm=openai.LLM(model="gpt-4o-mini"),
+                tts=openai.TTS(voice="nova"),
+                turn_detection=MultilingualModel(),
+            )
+            logger.info(f"Job {job_id}: AgentSession created.")
+        except Exception as e:
+             logger.error(f"Job {job_id}: Failed to create AgentSession: {e}", exc_info=True)
+             raise RuntimeError("Failed to create AgentSession") from e
+        
+        if session and local_participant:
+            callback_with_context = partial(speech_completion_callback, participant=local_participant)
 
+            @session.on("speech_created")
+            def on_speech_created(event: SpeechCreatedEvent): # noqa: F841 <-- Opsional
+                """Listener yang dipanggil setiap kali agent mulai berbicara."""
+                logger.info(f"Agent speech created, attaching completion callback.") # Log disederhanakan
+
+                # --- MODIFIKASI AKSES ATRIBUT DI SINI ---
+                # handle: SpeechHandle = event.handle # <-- Baris Lama
+                handle: SpeechHandle = event.speech_handle # <-- Atribut yang Benar ([1])
+
+                # Daftarkan callback ke handle yang didapatkan
+                handle.add_done_callback(callback_with_context)
+
+            logger.info(f"Job {job_id}: Registered listener for 'speech_created' event.")
+        else:
+            logger.error(f"Job {job_id}: Cannot register speech_created listener...")
+
+        # --- Setup Metrics Collector (Tetap Sama) ---
         usage_collector = metrics.UsageCollector()
         @session.on("metrics_collected")
         def _on_metrics_collected(ev: MetricsCollectedEvent):
@@ -623,96 +795,156 @@ async def entrypoint(ctx: JobContext):
         ctx.add_shutdown_callback(log_final_usage)
         logger.info(f"Job {job_id}: Metrics collector and shutdown logger registered.")
 
-        if not ctx.room or not ctx.room.local_participant:
-            logger.critical(f"Job {job_id}: Room or LocalParticipant not available after connect. Cannot proceed.")
-            # Anda mungkin ingin menangani error ini dengan lebih baik, misal raise Exception
-            raise ConnectionError("Failed to get local participant after connecting.")
-        
+        # --- Buat Instance Agent ---
         logger.info(f"Job {job_id}: Instantiating AntyAgent...")
-        agent = AntyAgent(
-            mem0_client=local_mem0_client,
-            user_id=persistent_user_id,
-            direct_openai_client=direct_openai_client,
-            local_participant=ctx.room.local_participant, # <-- Teruskan local_participant
-        )
-        agent._user_name = extracted_user_name
+        try:
+            agent = AntyAgent(
+                mem0_client=local_mem0_client,
+                user_id=persistent_user_id,
+                direct_openai_client=direct_openai_client,
+                local_participant=local_participant, # Berikan local_participant yang valid
+            )
+            agent._user_name = extracted_user_name
+            logger.info(f"Job {job_id}: AntyAgent instantiated.")
+        except Exception as e:
+             logger.error(f"Job {job_id}: Failed to instantiate AntyAgent: {e}", exc_info=True)
+             raise RuntimeError("Failed to instantiate AntyAgent") from e
 
-        def room_data_handler_sync(data_packet: DataPacket, participant: Optional[RemoteParticipant] = None): # Tambahkan '= None'
-            # Handler untuk Room.on("data_received")
-            # Sekarang participant bisa None jika tidak disediakan oleh emitter
-            participant_identity: Optional[str] = None # Default ke None
-            if participant is not None:
-                participant_identity = participant.identity # Dapatkan identity jika participant ada
-                logger.debug(f"Job {job_id}: Room sync handler received data from {participant_identity}, scheduling async handler.")
-            else:
-                # Log jika participant None
-                logger.debug(f"Job {job_id}: Room sync handler received data, but participant is None. Data: {data_packet.data[:50]}...")
+        # --- Definisikan dan Daftarkan Data Handler (Tetap Sama) ---
+        # Pastikan agent sudah ada
+        if agent:
+            def room_data_handler_sync_local(data_packet: DataPacket, participant: Optional[RemoteParticipant] = None):
+                participant_identity: Optional[str] = None
+                if participant is not None:
+                    participant_identity = participant.identity
+                    logger.debug(f"Job {job_id}: Room sync handler received data from {participant_identity}, scheduling async handler.")
+                else:
+                    logger.debug(f"Job {job_id}: Room sync handler received data, but participant is None. Data Kind: {data_packet.kind}, Data: {data_packet.data[:50]}...")
 
-            # Tetap panggil _on_data_received, teruskan participant_identity (bisa None)
-            # Pastikan _on_data_received bisa menangani participant_identity == None jika perlu
-            asyncio.create_task(agent._on_data_received(data_packet.data, participant_identity))
+                # Panggil _on_data_received dari instance agent
+                asyncio.create_task(agent._on_data_received(data_packet.data, participant_identity))
 
-        # Pendaftaran handler tetap sama:
-        ctx.room.on("data_received", room_data_handler_sync)
-        logger.info(f"Job {job_id}: Registered synchronous data received handler directly on Room object.")
-        
+            room_data_handler_sync = room_data_handler_sync_local # Assign ke variabel di scope luar
+            ctx.room.on("data_received", room_data_handler_sync)
+            room_data_handler_sync_defined = True
+            logger.info(f"Job {job_id}: Registered synchronous data received handler directly on Room object.")
+        else:
+             logger.error(f"Job {job_id}: Agent not instantiated, cannot define or register room data handler.")
 
-        logger.info(f"Job {job_id}: Starting AgentSession...")
+
+        # --- Tunggu Partisipan dan Mulai Session ---
+        logger.info(f"Job {job_id}: Starting AgentSession process...")
         logger.info(f"Job {job_id}: Waiting for participant to join...")
-        await ctx.wait_for_participant()
+        await ctx.wait_for_participant() # Tunggu partisipan non-agent
         logger.info(f"Job {job_id}: Participant joined. Starting session processing.")
 
-        await session.start(
-            agent=agent,
-            room=ctx.room,
-            room_input_options=RoomInputOptions(),
-            room_output_options=RoomOutputOptions(transcription_enabled=True),
-        )
-        logger.info(f"Job {job_id}: AgentSession started successfully.")
+        # Mulai session HANYA jika agent dan session sudah dibuat
+        if agent and session:
+            await session.start(
+                agent=agent,
+                room=ctx.room,
+                room_input_options=RoomInputOptions(),
+                room_output_options=RoomOutputOptions(transcription_enabled=True),
+            )
+            logger.info(f"Job {job_id}: AgentSession started successfully.")
+        else:
+             logger.critical(f"Job {job_id}: Cannot start AgentSession because agent or session is None.")
+             raise RuntimeError("Agent or Session not initialized correctly.")
 
-        # --- Logika Inisialisasi yang Dipindahkan (sebelumnya di AntyAgent.setup) ---
+        # --- Logika Salam Pembuka dengan Callback (Tetap Sama) ---
         logger.info(f"Agent initial greeting logic started for user {persistent_user_id}")
         start_greeting_time = time.time()
-
         greeting_text = f"Halo{' ' + agent._user_name if agent._user_name else ''}, Ada yang bisa saya bantu hari ini?"
+        processed_greeting = preprocess_text_for_tts(greeting_text)
+        logger.info(f"Speaking initial greeting: '{processed_greeting}'")
 
-        logger.info(f"Speaking initial greeting: '{greeting_text}'")
-        try:
-             session.generate_reply(instructions=greeting_text)
-             logger.info("Initial greeting generation requested from LLM.")
-        except Exception as e:
-            logger.error(f"Error during initial greeting: {e}", exc_info=True)
+        if session:
+            try:
+                # Cukup panggil say() atau generate_reply(). Listener event akan menangani callback.
+                await session.say(
+                    text=processed_greeting,
+                    allow_interruptions=True
+                )
+                logger.info("Initial greeting speech initiated.")
+            except Exception as e:
+                logger.error(f"Error during initial greeting speech: {e}", exc_info=True)
+        else:
+            logger.error("Cannot initiate greeting: AgentSession not available.")
+
 
         logger.info(f"Agent initial greeting logic finished in {time.time() - start_greeting_time:.2f}s")
-        # --- Akhir Logika Inisialisasi yang Dipindahkan ---
+        # --- Akhir Logika Salam Pembuka ---
 
         total_setup_time = time.time() - start_entrypoint_time
         logger.info(f"Job {job_id}: Agent setup complete. Total time: {total_setup_time:.2f} seconds.")
 
-        await asyncio.Future()
+        # --- Loop Utama Agent ---
+        logger.info(f"Job {job_id}: Agent running...")
+        await asyncio.Future() # Keep the entrypoint alive
 
     except ValueError as e:
-        logger.error(f"CRITICAL: Job {job_id}: Could not obtain persistent user_id. Agent cannot proceed. Error: {e}")
+        # Tangkap error spesifik dari ekstraksi user ID atau validasi lain
+        logger.error(f"CRITICAL: Job {job_id}: Configuration or setup error. Agent cannot proceed. Error: {e}", exc_info=True)
+    except ConnectionError as e:
+        # Tangkap error koneksi
+        logger.error(f"CRITICAL: Job {job_id}: Connection error. Agent cannot proceed. Error: {e}", exc_info=True)
+    except SystemExit as e:
+        # Tangkap SystemExit jika user ID tidak ditemukan
+        logger.critical(f"CRITICAL: Job {job_id}: SystemExit due to missing user ID or critical setup failure: {e}")
+        # Tidak perlu raise lagi, biarkan finally berjalan
+    except RuntimeError as e:
+         # Tangkap error runtime dari inisialisasi komponen
+         logger.error(f"CRITICAL: Job {job_id}: Runtime error during initialization. Error: {e}", exc_info=True)
     except asyncio.CancelledError:
         logger.info(f"Agent job {job_id} cancelled.")
     except Exception as e:
-        logger.error(f"Unhandled error in agent entrypoint for Job {job_id}: {e}", exc_info=True)
+        # Tangkap semua error lain yang tidak terduga
+        logger.error(f"CRITICAL: Unhandled exception in agent entrypoint for Job {job_id}: {e}", exc_info=True)
     finally:
-        logger.info(f"Starting shutdown sequence for Job {job_id}...")
+        logger.info(f"Starting graceful shutdown sequence for Job {job_id}...")
         shutdown_start_time = time.time()
 
+        # --- Logika Shutdown yang Lebih Aman ---
+        # 1. Unregister event handlers
         try:
-            if 'ctx' in locals() and ctx.room and hasattr(ctx.room, 'off') and 'room_data_handler_sync' in locals():
-                 ctx.room.off("data_received", room_data_handler_sync)
-                 logger.info(f"Job {job_id}: Unregistered room data received handler.")
+            if 'ctx' in locals() and ctx.room and hasattr(ctx.room, 'off') and room_data_handler_sync_defined and room_data_handler_sync:
+                ctx.room.off("data_received", room_data_handler_sync)
+                logger.info(f"Job {job_id}: Unregistered room data received handler.")
+            elif room_data_handler_sync_defined:
+                 logger.warning(f"Job {job_id}: Could not unregister room data handler during shutdown (context/room missing but handler was defined).")
             else:
-                 logger.warning(f"Job {job_id}: Could not unregister room data handler during shutdown (context/room/handler missing).")
+                 logger.info(f"Job {job_id}: Room data handler was not registered, skipping unregistration.")
         except Exception as e:
             logger.warning(f"Job {job_id}: Error unregistering room data handler during shutdown: {e}")
 
+        # 2. Hentikan AgentSession
+        if session and hasattr(session, 'aclose'):
+            try:
+                await session.aclose()
+                logger.info(f"Job {job_id}: AgentSession closed.")
+            except Exception as e:
+                 logger.error(f"Job {job_id}: Error closing AgentSession: {e}", exc_info=True)
+        else:
+            logger.info(f"Job {job_id}: AgentSession not available or already closed.")
+
+        # 3. Tutup koneksi lain (misal OpenAI Client jika perlu)
+        # Biasanya tidak perlu ditutup manual, library menangani
         if direct_openai_client and hasattr(direct_openai_client, 'close'):
-             logger.info(f"Job {job_id}: (Skipping explicit close for Direct OpenAI Client)")
-             pass
+              logger.info(f"Job {job_id}: (Skipping explicit close for Direct OpenAI Client)")
+              pass
+
+        # 4. Disconnect dari Room
+        try:
+            if 'ctx' in locals() and hasattr(ctx, 'disconnect') and ctx.room and ctx.room.connection_state == ConnectionState.CONN_CONNECTED:
+                 await ctx.disconnect()
+                 logger.info(f"Job {job_id}: Agent disconnected from room.")
+            elif 'ctx' in locals() and ctx.room:
+                 logger.info(f"Job {job_id}: Agent already disconnected or context/room not available.")
+            else:
+                 logger.info(f"Job {job_id}: Context not available, skipping disconnect call.")
+        except Exception as e:
+             logger.error(f"Job {job_id}: Error disconnecting from room during shutdown: {e}", exc_info=True)
+
 
         logger.info(f"Agent shutdown sequence for Job {job_id} completed in {time.time() - shutdown_start_time:.2f}s")
 

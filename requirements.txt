@@ -3,3 +3,4 @@ python-dotenv
 openai
 aiohttp
 mem0ai
+num2words
