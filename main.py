@@ -29,7 +29,7 @@ from livekit.agents.llm import function_tool
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import openai, silero, groq
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from livekit.rtc import Room, DataPacketKind, LocalParticipant, RemoteParticipant, DataPacket
+from livekit.rtc import Room, DataPacketKind, LocalParticipant, RemoteParticipant, DataPacket, ConnectionState
 from livekit.agents.voice import SpeechHandle, SpeechCreatedEvent 
 
 from mem0 import MemoryClient
@@ -921,9 +921,20 @@ async def entrypoint(ctx: JobContext):
         if session and hasattr(session, 'aclose'):
             try:
                 await session.aclose()
-                logger.info(f"Job {job_id}: AgentSession closed.")
+                logger.info(f"Job {job_id}: AgentSession closed successfully.")
+            # --- PERUBAHAN DI SINI ---
+            except RuntimeError as e:
+                # Tangkap RuntimeError secara spesifik
+                if "no running event loop" in str(e):
+                    # Jika itu error yang kita harapkan saat shutdown, log sebagai warning
+                    logger.warning(f"Job {job_id}: Encountered expected 'no running event loop' during session.aclose() in shutdown. Error: {e}")
+                else:
+                    # Jika RuntimeError lain, tetap log sebagai error
+                    logger.error(f"Job {job_id}: Unexpected RuntimeError closing AgentSession: {e}", exc_info=True)
+            # --- AKHIR PERUBAHAN ---
             except Exception as e:
-                 logger.error(f"Job {job_id}: Error closing AgentSession: {e}", exc_info=True)
+                # Tangkap error umum lainnya
+                logger.error(f"Job {job_id}: Generic error closing AgentSession: {e}", exc_info=True)
         else:
             logger.info(f"Job {job_id}: AgentSession not available or already closed.")
 
